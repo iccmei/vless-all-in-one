@@ -152,60 +152,6 @@ db_get_all_protocols() {
     { jq -r '.xray | keys[]' "$DB_FILE" 2>/dev/null; jq -r '.singbox | keys[]' "$DB_FILE" 2>/dev/null; } | sort -u
 }
 
-# 数据库：负载均衡组
-# 添加负载均衡组
-db_add_balancer_group() {
-    local name="$1" strategy="$2" # strategy: random, leastPing, roundRobin
-    shift 2
-    local nodes=("$@")
-    
-    local nodes_json
-    nodes_json=$(printf '%s\n' "${nodes[@]}" | jq -R . | jq -s .)
-    local group_json
-    group_json=$(jq -n \
-        --arg name "$name" \
-        --arg strategy "$strategy" \
-        --argjson nodes "$nodes_json" \
-        '{name: $name, strategy: $strategy, nodes: $nodes}')
-    
-    local tmp
-    tmp=$(mktemp)
-    jq --argjson group "$group_json" \
-        '.balancer_groups = (.balancer_groups // []) + [$group]' \
-        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
-}
-
-# 获取所有负载均衡组
-db_get_balancer_groups() {
-    [[ ! -f "$DB_FILE" ]] && echo "[]" && return
-    jq -r '.balancer_groups // []' "$DB_FILE"
-}
-
-# 获取指定负载均衡组
-db_get_balancer_group() {
-    local name="$1"
-    [[ ! -f "$DB_FILE" ]] && return 1
-    jq -r --arg name "$name" '.balancer_groups[]? | select(.name == $name)' "$DB_FILE"
-}
-
-# 删除负载均衡组
-db_delete_balancer_group() {
-    local name="$1"
-    local tmp
-    tmp=$(mktemp)
-    jq --arg name "$name" \
-        '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]' \
-        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
-}
-
-# 检查负载均衡组是否存在
-db_balancer_group_exists() {
-    local name="$1"
-    [[ ! -f "$DB_FILE" ]] && return 1
-    local exists=$(jq --arg name "$name" \
-        '[.balancer_groups[]? | select(.name == $name)] | length' "$DB_FILE")
-    [[ "$exists" -gt 0 ]]
-}
 
 #═══════════════════════════════════════════════════════════════════════════════
 #  通用配置保存函数
