@@ -1458,6 +1458,11 @@ add_xray_inbound_v2() {
         socks)
             local use_tls=$(echo "$cfg" | jq -r '.tls // "false"')
             local sni=$(echo "$cfg" | jq -r '.sni // ""')
+            local auth_mode=$(echo "$cfg" | jq -r '.auth_mode // "password"')
+            local config_listen_addr=$(echo "$cfg" | jq -r '.listen_addr // empty')
+            local socks_listen_addr="${listen_addr:-}"
+            [[ -z "$socks_listen_addr" ]] && socks_listen_addr=$(_listen_addr)
+            [[ -n "$config_listen_addr" ]] && socks_listen_addr="$config_listen_addr"
             
             if [[ "$use_tls" == "true" ]]; then
                 # SOCKS5 + TLS
@@ -1468,16 +1473,16 @@ add_xray_inbound_v2() {
                     --arg cert "$CFG/certs/server.crt" \
                     --arg key "$CFG/certs/server.key" \
                     --arg tag "$inbound_tag" \
-                    --arg listen_addr "$listen_addr" \
+                    --arg listen_addr "$socks_listen_addr" \
+                    --arg auth_mode "$auth_mode" \
                 '{
                     port: $port,
                     listen: $listen_addr,
                     protocol: "socks",
-                    settings: {
-                        auth: "password",
-                        accounts: [{user: $username, pass: $password}],
+                    settings: ({
+                        auth: $auth_mode,
                         udp: true
-                    },
+                    } + (if $auth_mode == "noauth" then {} else {accounts: [{user: $username, pass: $password}]} end)),
                     streamSettings: {
                         network: "tcp",
                         security: "tls",
@@ -1494,16 +1499,16 @@ add_xray_inbound_v2() {
                     --arg username "$username" \
                     --arg password "$password" \
                     --arg tag "$inbound_tag" \
-                    --arg listen_addr "$listen_addr" \
+                    --arg listen_addr "$socks_listen_addr" \
+                    --arg auth_mode "$auth_mode" \
                 '{
                     port: $port,
                     listen: $listen_addr,
                     protocol: "socks",
-                    settings: {
-                        auth: "password",
-                        accounts: [{user: $username, pass: $password}],
+                    settings: ({
+                        auth: $auth_mode,
                         udp: true
-                    },
+                    } + (if $auth_mode == "noauth" then {} else {accounts: [{user: $username, pass: $password}]} end)),
                     tag: $tag
                 }' > "$tmp_inbound"
             fi
@@ -7089,50 +7094,61 @@ EOF
 # SOCKS5 服务端配置
 gen_socks_server_config() {
     local username="$1" password="$2" port="$3" use_tls="${4:-false}" sni="${5:-}"
+    local auth_mode="${6:-password}" listen_addr="${7:-}"
     mkdir -p "$CFG"
 
     # 构建配置 JSON
     local config_json=""
     if [[ "$use_tls" == "true" ]]; then
-        config_json=$(build_config username "$username" password "$password" port "$port" tls "true" sni "$sni")
+        config_json=$(build_config username "$username" password "$password" port "$port" tls "true" sni "$sni" auth_mode "$auth_mode" listen_addr "$listen_addr")
     else
-        config_json=$(build_config username "$username" password "$password" port "$port")
+        config_json=$(build_config username "$username" password "$password" port "$port" auth_mode "$auth_mode" listen_addr "$listen_addr")
     fi
     register_protocol "socks" "$config_json"
-    
+
     # SOCKS5 的 join 信息
     local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
     local tls_suffix=""
     [[ "$use_tls" == "true" ]] && tls_suffix="-TLS"
-    
+
     > "$CFG/socks.join"
-    if [[ -n "$ipv4" ]]; then
-        local data="SOCKS${tls_suffix}|$ipv4|$port|$username|$password"
-        [[ "$use_tls" == "true" ]] && data="SOCKS${tls_suffix}|$ipv4|$port|$username|$password|$sni"
-        local code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
-        local socks_link
-        if [[ "$use_tls" == "true" ]]; then
-            socks_link="socks5://${username}:${password}@${ipv4}:${port}?tls=true&sni=${sni}#SOCKS5-TLS-${ipv4}"
-        else
-            socks_link="socks5://${username}:${password}@${ipv4}:${port}#SOCKS5-${ipv4}"
+
+    # 无认证模式不生成 join 信息（因为没有用户名密码）
+    if [[ "$auth_mode" == "noauth" ]]; then
+        echo "# SOCKS5 无认证模式" >> "$CFG/socks.join"
+        echo "# 监听地址: $listen_addr" >> "$CFG/socks.join"
+        echo "# 端口: $port" >> "$CFG/socks.join"
+        [[ "$use_tls" == "true" ]] && echo "# TLS SNI: $sni" >> "$CFG/socks.join"
+    else
+        # 用户名密码模式生成完整的 join 信息
+        if [[ -n "$ipv4" ]]; then
+            local data="SOCKS${tls_suffix}|$ipv4|$port|$username|$password"
+            [[ "$use_tls" == "true" ]] && data="SOCKS${tls_suffix}|$ipv4|$port|$username|$password|$sni"
+            local code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
+            local socks_link
+            if [[ "$use_tls" == "true" ]]; then
+                socks_link="socks5://${username}:${password}@${ipv4}:${port}?tls=true&sni=${sni}#SOCKS5-TLS-${ipv4}"
+            else
+                socks_link="socks5://${username}:${password}@${ipv4}:${port}#SOCKS5-${ipv4}"
+            fi
+            printf '%s\n' "# IPv4" >> "$CFG/socks.join"
+            printf '%s\n' "JOIN_V4=$code" >> "$CFG/socks.join"
+            printf '%s\n' "SOCKS5_V4=$socks_link" >> "$CFG/socks.join"
         fi
-        printf '%s\n' "# IPv4" >> "$CFG/socks.join"
-        printf '%s\n' "JOIN_V4=$code" >> "$CFG/socks.join"
-        printf '%s\n' "SOCKS5_V4=$socks_link" >> "$CFG/socks.join"
-    fi
-    if [[ -n "$ipv6" ]]; then
-        local data="SOCKS${tls_suffix}|[$ipv6]|$port|$username|$password"
-        [[ "$use_tls" == "true" ]] && data="SOCKS${tls_suffix}|[$ipv6]|$port|$username|$password|$sni"
-        local code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
-        local socks_link
-        if [[ "$use_tls" == "true" ]]; then
-            socks_link="socks5://${username}:${password}@[$ipv6]:${port}?tls=true&sni=${sni}#SOCKS5-TLS-[$ipv6]"
-        else
-            socks_link="socks5://${username}:${password}@[$ipv6]:${port}#SOCKS5-[$ipv6]"
+        if [[ -n "$ipv6" ]]; then
+            local data="SOCKS${tls_suffix}|[$ipv6]|$port|$username|$password"
+            [[ "$use_tls" == "true" ]] && data="SOCKS${tls_suffix}|[$ipv6]|$port|$username|$password|$sni"
+            local code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
+            local socks_link
+            if [[ "$use_tls" == "true" ]]; then
+                socks_link="socks5://${username}:${password}@[$ipv6]:${port}?tls=true&sni=${sni}#SOCKS5-TLS-[$ipv6]"
+            else
+                socks_link="socks5://${username}:${password}@[$ipv6]:${port}#SOCKS5-[$ipv6]"
+            fi
+            printf '%s\n' "# IPv6" >> "$CFG/socks.join"
+            printf '%s\n' "JOIN_V6=$code" >> "$CFG/socks.join"
+            printf '%s\n' "SOCKS5_V6=$socks_link" >> "$CFG/socks.join"
         fi
-        printf '%s\n' "# IPv6" >> "$CFG/socks.join"
-        printf '%s\n' "JOIN_V6=$code" >> "$CFG/socks.join"
-        printf '%s\n' "SOCKS5_V6=$socks_link" >> "$CFG/socks.join"
     fi
     echo "server" > "$CFG/role"
 }
@@ -15202,7 +15218,8 @@ do_install_server() {
             local username_default=$(gen_password 8) password_default=$(gen_password)
             local username="$username_default" password="$password_default"
             local use_tls="false" sni=""
-            
+            local auth_mode="password" listen_addr=""
+
             # 询问是否启用 TLS
             echo ""
             _line
@@ -15212,38 +15229,70 @@ do_install_server() {
             echo -e "  ${G}2)${NC} 启用 TLS ${D}(加密传输，需要证书)${NC}"
             echo ""
             read -rp "  请选择 [1]: " tls_choice
-            
+
             if [[ "$tls_choice" == "2" ]]; then
                 use_tls="true"
                 # 调用统一的证书配置函数
                 setup_cert_and_nginx "socks"
                 local cert_domain="$CERT_DOMAIN"
-                
+
                 # 询问 SNI 配置（与其他 TLS 协议一致）
                 sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
-                
+
                 # 如果没有真实证书，使用自签证书（用 SNI 作为 CN）
                 if [[ -z "$cert_domain" ]]; then
                     gen_self_cert "$sni"
                 fi
             fi
 
+            # 询问认证模式
             echo ""
             _line
-            echo -e "  ${W}SOCKS5 账号设置${NC}"
+            echo -e "  ${W}SOCKS5 认证设置${NC}"
             _line
-            read -rp "  请输入用户名 [回车使用 $username_default]: " _username
-            [[ -n "$_username" ]] && username="$_username"
-            read -rp "  请输入密码 [回车使用 $password_default]: " _password
-            [[ -n "$_password" ]] && password="$_password"
-            
+            echo -e "  ${G}1)${NC} 用户名密码认证 ${D}(推荐)${NC}"
+            echo -e "  ${G}2)${NC} 无认证 ${D}(需指定监听地址)${NC}"
+            echo ""
+            read -rp "  请选择 [1]: " auth_choice
+
+            if [[ "$auth_choice" == "2" ]]; then
+                auth_mode="noauth"
+                # 询问监听地址
+                local default_listen="127.0.0.1"
+                echo ""
+                _line
+                echo -e "  ${W}监听地址配置${NC}"
+                _line
+                echo -e "  ${D}建议仅监听本地地址 (127.0.0.1) 以提高安��性${NC}"
+                echo -e "  ${D}监听 0.0.0.0 将允许所有地址访问${NC}"
+                echo ""
+                read -rp "  请输入监听地址 [回车使用 $default_listen]: " _listen
+                listen_addr="${_listen:-$default_listen}"
+            else
+                # 用户名密码模式
+                echo ""
+                _line
+                echo -e "  ${W}SOCKS5 账号设置${NC}"
+                _line
+                read -rp "  请输入用户名 [回车使用 $username_default]: " _username
+                [[ -n "$_username" ]] && username="$_username"
+                read -rp "  请输入密码 [回车使用 $password_default]: " _password
+                [[ -n "$_password" ]] && password="$_password"
+            fi
+
             echo ""
             _line
             echo -e "  ${C}SOCKS5 配置${NC}"
             _line
             echo -e "  端口: ${G}$port${NC}"
-            echo -e "  用户名: ${G}$username${NC}"
-            echo -e "  密码: ${G}$password${NC}"
+            if [[ "$auth_mode" == "noauth" ]]; then
+                echo -e "  认证: ${D}无认证${NC}"
+                echo -e "  监听地���: ${G}$listen_addr${NC}"
+            else
+                echo -e "  认证: ${G}用户名密码${NC}"
+                echo -e "  用户名: ${G}$username${NC}"
+                echo -e "  密码: ${G}$password${NC}"
+            fi
             if [[ "$use_tls" == "true" ]]; then
                 echo -e "  TLS: ${G}启用${NC} (SNI: $sni)"
             else
@@ -15251,12 +15300,12 @@ do_install_server() {
             fi
             _line
             echo ""
-            
+
             read -rp "  确认安装? [Y/n]: " confirm
             [[ "$confirm" =~ ^[nN]$ ]] && return
-            
+
             _info "生成配置..."
-            gen_socks_server_config "$username" "$password" "$port" "$use_tls" "$sni"
+            gen_socks_server_config "$username" "$password" "$port" "$use_tls" "$sni" "$auth_mode" "$listen_addr"
             ;;
         ss2022)
             # SS2022 加密方式选择
