@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.2.2 [服务端]
+#  多协议代理一键部署脚本 v3.3.1 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Chil30/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.3.0"
+readonly VERSION="3.3.1"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly SCRIPT_REPO="Chil30/vless-all-in-one"
@@ -2074,7 +2074,17 @@ recommend_port() {
                 fi
             fi
             ;;
-        vless|vless-xhttp|vless-vision|trojan|anytls|snell-shadowtls|snell-v5-shadowtls|ss2022-shadowtls)
+        vless|vless-xhttp)
+            # Reality 协议：伪装特性使其可使用任意端口，默认随机高位端口
+            while true; do
+                local p=$(gen_port)
+                if ! is_internal_port_occupied "$p" >/dev/null; then
+                    echo "$p"
+                    break
+                fi
+            done
+            ;;
+        vless-vision|trojan|anytls|snell-shadowtls|snell-v5-shadowtls|ss2022-shadowtls)
             # 这些协议需要对外暴露，优先使用 HTTPS 端口
             if ! ss -tuln 2>/dev/null | grep -q ":443 " && ! is_internal_port_occupied "443" >/dev/null; then
                 echo "443"
@@ -2138,7 +2148,12 @@ ask_port() {
                 fi
             fi
             ;;
-        vless|vless-xhttp|vless-vision|trojan)
+        vless|vless-xhttp)
+            # Reality 协议默认随机端口
+            echo -e "  ${D}(Reality 协议伪装能力强，可使用任意端口)${NC}" >&2
+            echo -e "  ${C}建议: ${G}$recommend${NC} (随机高位端口)" >&2
+            ;;
+        vless-vision|trojan)
             if [[ "$recommend" == "443" ]]; then
                 echo -e "  ${C}建议: ${G}443${NC} (标准 HTTPS 端口)" >&2
             else
@@ -7415,7 +7430,22 @@ create_service() {
 
     [[ -z "$service_name" ]] && { _err "未知协议: $protocol"; return 1; }
 
-    _need_cfg() { db_exists "singbox" "$1" || { _err "$2 配置不存在"; return 1; }; }
+    # 检查配置是否存在（支持 xray 和 singbox 核心）
+    _need_cfg() { 
+        local proto="$1" name="$2"
+        db_exists "xray" "$proto" || db_exists "singbox" "$proto" || { _err "$name 配置不存在"; return 1; }
+    }
+    
+    # 获取协议配置所在的核心
+    _get_proto_core() {
+        local proto="$1"
+        # ss2022-shadowtls 保存在 xray 核心
+        if [[ "$proto" == "ss2022-shadowtls" ]]; then
+            echo "xray"
+        else
+            echo "singbox"
+        fi
+    }
 
     case "$kind" in
         anytls)
@@ -7433,13 +7463,14 @@ create_service() {
             ;;
         shadowtls)
             _need_cfg "$protocol" "$protocol" || return 1
-            port=$(db_get_field "singbox" "$protocol" "port")
-            sni=$(db_get_field "singbox" "$protocol" "sni")
-            stls_password=$(db_get_field "singbox" "$protocol" "stls_password")
+            local cfg_core=$(_get_proto_core "$protocol")
+            port=$(db_get_field "$cfg_core" "$protocol" "port")
+            sni=$(db_get_field "$cfg_core" "$protocol" "sni")
+            stls_password=$(db_get_field "$cfg_core" "$protocol" "stls_password")
             if [[ "$protocol" == "ss2022-shadowtls" ]]; then
-                ss_backend_port=$(db_get_field "singbox" "$protocol" "ss_backend_port")
+                ss_backend_port=$(db_get_field "$cfg_core" "$protocol" "ss_backend_port")
             else
-                snell_backend_port=$(db_get_field "singbox" "$protocol" "snell_backend_port")
+                snell_backend_port=$(db_get_field "$cfg_core" "$protocol" "snell_backend_port")
             fi
             local lh=$(_listen_addr)
             exec_cmd="/usr/local/bin/shadow-tls --v3 server --listen $(_fmt_hostport "$lh" "$port") --server 127.0.0.1:${ss_backend_port:-$snell_backend_port} --tls ${sni}:443 --password ${stls_password}"
@@ -14003,17 +14034,17 @@ show_single_protocol_info() {
             echo -e "  ${D}提示: 请在主菜单选择「订阅管理」配置订阅服务${NC}"
         fi
     elif [[ "$has_reality" == "true" && ("$protocol" == "vless" || "$protocol" == "vless-xhttp") ]]; then
-        # Reality 协议，检查是否有真实域名配置
-        if [[ -n "$domain" && -f "$CFG/sub.info" ]]; then
+        # Reality 协议：订阅需要手动配置真实域名和启用
+        if [[ -n "$domain" && -f "$CFG/sub.info" && "$web_service_running" == "true" ]]; then
             source "$CFG/sub.info"
             
-            # Reality 真实域名模式时，订阅链接用 Nginx 端口 (sub_port)
-            if [[ -n "$sub_port" ]]; then
+            # Reality 真实域名模式时，检查订阅是否已手动启用
+            if [[ "${sub_enabled:-false}" == "true" && -n "$sub_port" ]]; then
                 local base_url="https://${sub_domain:-$domain}:${sub_port}/sub/${sub_uuid}"
                 echo -e "  ${Y}Clash/Clash Verge:${NC}"
                 echo -e "  ${G}$base_url/clash${NC}"
             else
-                echo -e "  ${D}(配置读取失败)${NC}"
+                echo -e "  ${D}(订阅服务未启用，如需使用请在主菜单选择「订阅管理」)${NC}"
             fi
         else
             echo -e "  ${D}(直接使用分享链接即可)${NC}"
@@ -14586,16 +14617,32 @@ do_uninstall() {
         cleaned_items+=("fake-web服务")
     fi
     
-    # 清理Nginx配置
-    if [[ -f "/etc/nginx/sites-enabled/vless-fake" ]]; then
-        rm -f /etc/nginx/sites-enabled/vless-fake /etc/nginx/sites-available/vless-fake
-        # 尝试重载Nginx，忽略错误（兼容 systemd / openrc）
-        if nginx -t 2>/dev/null; then
+    # 清理所有 vless 相关的 Nginx 配置
+    local nginx_cleaned=false
+    
+    # 删除 sites-available/enabled 配置
+    for cfg in /etc/nginx/sites-enabled/vless-* /etc/nginx/sites-available/vless-*; do
+        [[ -f "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
+    done
+    
+    # 删除 conf.d 配置 (Debian/Ubuntu/CentOS)
+    for cfg in /etc/nginx/conf.d/vless-*.conf; do
+        [[ -f "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
+    done
+    
+    # 删除 http.d 配置 (Alpine)
+    for cfg in /etc/nginx/http.d/vless-*.conf; do
+        [[ -f "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
+    done
+    
+    # 如果清理了配置，重载 nginx 释放端口
+    if [[ "$nginx_cleaned" == "true" ]]; then
+        if command -v nginx &>/dev/null && nginx -t 2>/dev/null; then
             svc reload nginx 2>/dev/null || svc restart nginx 2>/dev/null
+            cleaned_items+=("Nginx配置")
         else
-            _warn "Nginx配置有问题，跳过重载"
+            _warn "Nginx配置有问题或未安装，跳过重载"
         fi
-        cleaned_items+=("Nginx配置")
     fi
     
     # 显示清理结果
@@ -15899,7 +15946,9 @@ show_status() {
         [[ ",$singbox_keys," == *",$p,"* ]] && singbox_protocols="$singbox_protocols $p"
     done
     for p in $STANDALONE_PROTOCOLS; do
-        [[ ",$singbox_keys," == *",$p,"* ]] && standalone_protocols="$standalone_protocols $p"
+        if [[ ",$xray_keys," == *",$p,"* ]] || [[ ",$singbox_keys," == *",$p,"* ]]; then
+            standalone_protocols="$standalone_protocols $p"
+        fi
     done
     xray_protocols="${xray_protocols# }"
     singbox_protocols="${singbox_protocols# }"
