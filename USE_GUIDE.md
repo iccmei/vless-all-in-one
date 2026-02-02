@@ -1749,7 +1749,7 @@ vless → 9) CF Tunnel(Argo)
   ▸ 安装到 /usr/local/bin/cloudflared
   ✓ 安装成功
   
-  版本: 2024.1.5
+  版本: 2026.1.5
 ─────────────────────────────────────────────
 ```
 
@@ -2145,7 +2145,7 @@ vless → 6) 订阅服务管理
   订阅服务管理
 ─────────────────────────────────────────────
   状态: 已配置
-  端口: 8443
+  端口: 18443
   域名: example.com
   HTTPS: true
 ─────────────────────────────────────────────
@@ -2161,9 +2161,9 @@ vless → 6) 订阅服务管理
 ### 订阅链接格式
 
 ```
-https://example.com:8443/sub/{UUID}/clash   # Clash/Clash Verge
-https://example.com:8443/sub/{UUID}/surge   # Surge
-https://example.com:8443/sub/{UUID}/v2ray   # V2Ray/Loon/通用
+https://example.com:18443/sub/{UUID}/clash   # Clash/Clash Verge
+https://example.com:18443/sub/{UUID}/surge   # Surge
+https://example.com:18443/sub/{UUID}/v2ray   # V2Ray/Loon/通用
 ```
 
 ### 订阅特性

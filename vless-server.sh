@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.5 [服务端]
+#  多协议代理一键部署脚本 v3.4.6 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Chil30/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.5"
+readonly VERSION="3.4.6"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly SCRIPT_REPO="Chil30/vless-all-in-one"
@@ -449,6 +449,14 @@ get_protocol_name() {
     esac
 }
 
+# 检查是否为独立协议（不支持多用户和流量统计）
+# 独立协议由独立二进制运行，使用配置文件中的固定密钥
+# 用法: is_standalone_protocol "snell" -> 返回 0 表示是独立协议
+is_standalone_protocol() {
+    local proto="$1"
+    [[ " $STANDALONE_PROTOCOLS " == *" $proto "* ]]
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
 #  多用户配置生成辅助函数
 #═══════════════════════════════════════════════════════════════════════════════
@@ -675,6 +683,12 @@ db_add_user() {
     # 检查协议是否存在
     if ! db_exists "$core" "$proto"; then
         _err "协议 $proto 不存在"
+        return 1
+    fi
+    
+    # 检查是否为独立协议（不支持多用户）
+    if is_standalone_protocol "$proto"; then
+        _err "独立协议 $proto 不支持添加用户"
         return 1
     fi
     
@@ -1681,22 +1695,39 @@ _save_join_info() {
 
 # 检测 TLS 主协议并返回外部端口（用于 WS 类回落协议）
 # 注意：Reality (vless) 不支持 WS 回落，只有 vless-vision 和 trojan 可以
+# 仅当主协议端口为 8443 时才触发回落
 # 用法: outer_port=$(_get_master_port "$default_port")
 _get_master_port() {
     local default_port="$1"
+    local master_port=""
+    
     if db_exists "xray" "vless-vision"; then
-        db_get_field "xray" "vless-vision" "port"
+        master_port=$(db_get_field "xray" "vless-vision" "port")
     elif db_exists "xray" "trojan"; then
-        db_get_field "xray" "trojan" "port"
+        master_port=$(db_get_field "xray" "trojan" "port")
+    fi
+    
+    # 仅当主协议端口为 8443 时才返回主端口（触发回落）
+    if [[ "$master_port" == "8443" ]]; then
+        echo "$master_port"
     else
         echo "$default_port"
     fi
 }
 
-# 检测是否有 TLS 主协议 (支持 WS 回落的协议)
+# 检测是否有 TLS 主协议且端口为 8443 (支持 WS 回落的协议)
 # 注意：Reality 使用 uTLS，不支持 WS 类型的回落
 _has_master_protocol() {
-    db_exists "xray" "vless-vision" || db_exists "xray" "trojan"
+    local master_port=""
+    
+    if db_exists "xray" "vless-vision"; then
+        master_port=$(db_get_field "xray" "vless-vision" "port")
+    elif db_exists "xray" "trojan"; then
+        master_port=$(db_get_field "xray" "trojan" "port")
+    fi
+    
+    # 仅当主协议存在且端口为 8443 时返回成功
+    [[ "$master_port" == "8443" ]]
 }
 
 # 检查证书是否为 CA 签发的真实证书
@@ -2167,7 +2198,15 @@ filter_installed() { # filter_installed "proto1 proto2 ..."
 
 get_xray_protocols()       { filter_installed "$XRAY_PROTOCOLS"; }
 get_singbox_protocols()    { filter_installed "$SINGBOX_PROTOCOLS"; }
-get_standalone_protocols() { filter_installed "$STANDALONE_PROTOCOLS"; }
+get_standalone_protocols() {
+    # 独立协议使用 db_exists 逐个检测，避免 grep 匹配问题
+    local p
+    for p in $STANDALONE_PROTOCOLS; do
+        if db_exists "xray" "$p" || db_exists "singbox" "$p"; then
+            echo "$p"
+        fi
+    done
+}
 
 # 生成用户级路由规则
 # 遍历所有用户，为有自定义routing的用户生成Xray routing rules
@@ -2914,11 +2953,18 @@ add_xray_inbound_v2() {
     # 生成唯一的 inbound tag（基础协议名 + 端口）
     local inbound_tag="${base_protocol}-${port}"
     
-    # 检测主协议和回落配置
+    # 检测主协议和回落配置（仅当主协议端口为 8443 时才启用回落模式）
     local has_master=false
-    db_exists "xray" "vless-vision" && has_master=true
-    db_exists "xray" "vless" && has_master=true
-    db_exists "xray" "trojan" && has_master=true
+    local master_port=""
+    for proto in vless-vision trojan; do
+        if db_exists "xray" "$proto"; then
+            master_port=$(db_get_field "xray" "$proto" "port" 2>/dev/null)
+            if [[ "$master_port" == "8443" ]]; then
+                has_master=true
+                break
+            fi
+        fi
+    done
     
     # 构建回落数组
     local fallbacks='[{"dest":"127.0.0.1:80","xver":0}]'
@@ -4015,11 +4061,16 @@ ask_port() {
     local protocol="$1"
     local recommend=$(recommend_port "$protocol")
     
-    # 检查是否已安装主协议
+    # 检查是否已安装主协议在 8443 端口（仅 8443 端口才触发回落）
     local has_master=false
-    if db_exists "xray" "vless-vision" || db_exists "xray" "vless" || db_exists "xray" "trojan"; then
-        has_master=true
-    fi
+    local master_port=""
+    for proto in vless-vision vless trojan; do
+        master_port=$(db_get_port "xray" "$proto" 2>/dev/null)
+        if [[ "$master_port" == "8443" ]]; then
+            has_master=true
+            break
+        fi
+    done
     
     echo "" >&2
     _line >&2
@@ -4029,9 +4080,11 @@ ask_port() {
     case "$protocol" in
         vless-ws|vmess-ws)
             if [[ "$has_master" == "true" ]]; then
-                # 回落子协议，内部端口
-                echo -e "  ${D}(作为回落子协议，监听本地，外部通过 443 访问)${NC}" >&2
-                echo -e "  ${C}建议: ${G}$recommend${NC} (内部端口，随机即可)" >&2
+                # 回落子协议，自动分配内部端口，不询问用户
+                echo -e "  ${D}(作为回落子协议，监听本地，外部通过 8443 访问)${NC}" >&2
+                echo -e "  ${C}自动分配内部端口: ${G}$recommend${NC}" >&2
+                echo "$recommend"
+                return 0
             elif [[ "$recommend" == "443" ]]; then
                 echo -e "  ${C}建议: ${G}443${NC} (标准 HTTPS 端口)" >&2
             else
@@ -4140,7 +4193,8 @@ ask_port() {
         fi
         
         # 2. 检查系统端口占用 (Nginx 等外部程序)
-        if ss -tuln 2>/dev/null | grep -q ":$custom_port " || netstat -tuln 2>/dev/null | grep -q ":$custom_port "; then
+        # 使用正则匹配：端口号后跟非数字字符（空格、tab、冒号等）
+        if ss -tuln 2>/dev/null | grep -Eq ":${custom_port}[^0-9]" || netstat -tuln 2>/dev/null | grep -Eq ":${custom_port}[^0-9]"; then
             # 覆盖模式：如果是被覆盖的端口，允许使用（服务正在运行是正常的）
             if [[ "$INSTALL_MODE" == "replace" && "$custom_port" == "$REPLACE_PORT" ]]; then
                 echo "$custom_port"
@@ -4707,71 +4761,30 @@ EOF
     
 }
 
-# 全局 SNI 域名列表（常见企业子域名，用于 Reality 伪装）
+# 全局 SNI 域名列表（大陆可访问的企业子域名，用于 Reality 伪装）
 readonly COMMON_SNI_LIST=(
-    # 微软子域名（企业/开发者常用）
-    "learn.microsoft.com"
-    "azure.microsoft.com"
-    "docs.microsoft.com"
-    "developer.microsoft.com"
-    "visualstudio.microsoft.com"
-    "technet.microsoft.com"
-    "msdn.microsoft.com"
-    # 苹果子域名
-    "support.apple.com"
+    "ads.apple.com"
+    "advertising.apple.com"
+    "apple.apple.com"
+    "apps.apple.com"
+    "asia.apple.com"
+    "books.apple.com"
+    "community.apple.com"
+    "crl.apple.com"
     "developer.apple.com"
-    "itunes.apple.com"
+    "files.apple.com"
+    "guide.apple.com"
+    "iphone.apple.com"
+    "link.apple.com"
+    "maps.apple.com"
+    "ml.apple.com"
+    "music.apple.com"
+    "one.apple.com"
     "store.apple.com"
-    # 云服务子域名
-    "aws.amazon.com"
-    "console.aws.amazon.com"
-    "developer.amazon.com"
-    # 企业软件子域名
-    "docs.oracle.com"
-    "cloud.oracle.com"
-    "developer.cisco.com"
-    "helpx.adobe.com"
-    "docs.vmware.com"
-    "help.sap.com"
-    "developer.ibm.com"
-    "cloud.ibm.com"
-    # 硬件厂商子域名
-    "developer.nvidia.com"
-    "developer.amd.com"
-    "software.intel.com"
-    "developer.samsung.com"
-    "support.dell.com"
-    "support.hp.com"
-    "developers.hp.com"
-    "support.lenovo.com"
-    "download.lenovo.com"
-    # CDN 和云服务
-    "developers.cloudflare.com"
-    "dash.cloudflare.com"
-    "developer.akamai.com"
-    "docs.fastly.com"
-    # 开发者平台
-    "meta.stackoverflow.com"
-    "api.stackexchange.com"
-    "old.reddit.com"
-    "api.reddit.com"
-    "en.wikipedia.org"
-    "meta.wikimedia.org"
-    # 游戏平台
-    "store.steampowered.com"
-    "help.steampowered.com"
-    "store.epicgames.com"
-    "help.ea.com"
-    "store.ubi.com"
-    # 其他知名企业
-    "store.sony.com"
-    "support.sony.com"
-    "business.panasonic.com"
-    "business.lg.com"
-    "support.lg.com"
-    "support.philips.com"
-    "support.siemens.com"
-    "docs.bosch.com"
+    "support.apple.com"
+    "time.apple.com"
+    "tv.apple.com"
+    "videos.apple.com"
 )
 
 gen_sni() { 
@@ -5577,18 +5590,25 @@ get_acme_cert() {
 # 设置全局变量: CERT_DOMAIN, NGINX_PORT
 setup_cert_and_nginx() {
     local protocol="$1"
-    local default_nginx_port="8443"
+    local default_nginx_port="18443"
     
     # 全局变量，供调用方使用
     CERT_DOMAIN=""
     NGINX_PORT="$default_nginx_port"
     
-    # === 回落子协议检测：如果是 WS 协议且有主协议，跳过 Nginx 配置 ===
+    # === 回落子协议检测：如果是 WS 协议且主协议在 8443 端口，跳过 Nginx 配置 ===
     local is_fallback_mode=false
     if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan-ws" ]]; then
-        if db_exists "xray" "vless-vision" || db_exists "xray" "trojan"; then
-            is_fallback_mode=true
-        fi
+        local master_port=""
+        for proto in vless-vision trojan; do
+            if db_exists "xray" "$proto"; then
+                master_port=$(db_get_field "xray" "$proto" "port" 2>/dev/null)
+                if [[ "$master_port" == "8443" ]]; then
+                    is_fallback_mode=true
+                    break
+                fi
+            fi
+        done
     fi
     
     # 检测是否已有证书
@@ -5821,31 +5841,28 @@ ask_sni_config() {
     local random_sni=$(gen_sni)
     
     # 如果有证书域名（自签名证书），询问是否使用
+    # 注意：自签名证书的域名没有实际意义，推荐使用随机 SNI
     if [[ -n "$cert_domain" ]]; then
-        echo -e "  ${G}1${NC}) 使用证书域名 (${G}$cert_domain${NC}) - 推荐" >&2
-        echo -e "  ${G}2${NC}) 使用随机SNI (${G}$random_sni${NC}) - 更隐蔽" >&2
-        echo -e "  ${G}3${NC}) 自定义SNI" >&2
+        echo -e "  ${G}1${NC}) 使用随机SNI (${G}$random_sni${NC}) - 推荐" >&2
+        echo -e "  ${G}2${NC}) 自定义SNI" >&2
         echo "" >&2
         
         local sni_choice=""
         while true; do
-            read -rp "  请选择 [1-3，默认 1]: " sni_choice
+            read -rp "  请选择 [1-2，默认 1]: " sni_choice
             
             if [[ -z "$sni_choice" ]]; then
                 sni_choice="1"
             fi
             
             if [[ "$sni_choice" == "1" ]]; then
-                echo "$cert_domain"
-                return 0
-            elif [[ "$sni_choice" == "2" ]]; then
                 echo "$random_sni"
                 return 0
-            elif [[ "$sni_choice" == "3" ]]; then
+            elif [[ "$sni_choice" == "2" ]]; then
                 break
             else
                 _err "无效选择: $sni_choice" >&2
-                _warn "请输入 1、2 或 3" >&2
+                _warn "请输入 1 或 2" >&2
             fi
         done
     else
@@ -15461,7 +15478,21 @@ show_all_protocols_info() {
         if [[ -n "$standalone_protocols" ]]; then
             echo -e "  ${Y}独立进程协议:${NC}"
             for protocol in $standalone_protocols; do
-                local port=$(db_get_field "singbox" "$protocol" "port")
+                local port=""
+                local cfg=""
+                # 同时检查 xray 和 singbox 核心（与 show_all_share_links 逻辑一致）
+                if db_exists "xray" "$protocol"; then
+                    cfg=$(db_get "xray" "$protocol" 2>/dev/null || true)
+                elif db_exists "singbox" "$protocol"; then
+                    cfg=$(db_get "singbox" "$protocol" 2>/dev/null || true)
+                fi
+                if [[ -n "$cfg" ]]; then
+                    if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                        port=$(echo "$cfg" | jq -r '.[].port' | tr '\n' ',' | sed 's/,$//')
+                    else
+                        port=$(echo "$cfg" | jq -r '.port // empty')
+                    fi
+                fi
                 if [[ -n "$port" ]]; then
                     echo -e "    ${G}$idx${NC}) $(get_protocol_name $protocol) - 端口: ${G}$port${NC}"
                     all_protocols+=("$protocol")
@@ -15594,8 +15625,6 @@ show_all_share_links() {
                     snell-v5-shadowtls)
                         echo -e "  ${Y}Surge:${NC}"
                         echo -e "  ${C}${country_code}-Snell-v5-ShadowTLS = snell, ${config_ip}, ${display_port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}"
-                        echo -e "  ${Y}Loon:${NC}"
-                        echo -e "  ${C}${country_code}-Snell-v5-ShadowTLS = snell, ${config_ip}, ${display_port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}${NC}"
                         has_links=true
                         ;;
                     ss2022-shadowtls)
@@ -15639,8 +15668,6 @@ show_all_share_links() {
                     snell-v5-shadowtls)
                         echo -e "  ${Y}Surge (IPv6):${NC}"
                         echo -e "  ${C}${country_code}-Snell-v5-ShadowTLS-v6 = snell, ${ipv6}, ${display_port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}"
-                        echo -e "  ${Y}Loon (IPv6):${NC}"
-                        echo -e "  ${C}${country_code}-Snell-v5-ShadowTLS-v6 = snell, ${ipv6}, ${display_port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}${NC}"
                         has_links=true
                         ;;
                     ss2022-shadowtls)
@@ -15761,23 +15788,24 @@ show_single_protocol_info() {
     local is_fallback_protocol=false
     local master_name=""
     if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan-ws" ]]; then
-        # 检查是否有 TLS 主协议 (Vision/Trojan)，注意 Reality 不能作为 WS 的主协议
+        # 检查是否有 TLS 主协议在 8443 端口 (仅 8443 端口才触发回落显示)
+        # 注意：Reality 不支持 WS 回落，只有 Vision/Trojan 可以
         if db_exists "xray" "vless-vision"; then
-            local master_port=$(db_get_field "xray" "vless-vision" "port")
-            if [[ -n "$master_port" ]]; then
+            local master_port=$(db_get_field "xray" "vless-vision" "port" 2>/dev/null)
+            if [[ "$master_port" == "8443" ]]; then
                 display_port="$master_port"
                 is_fallback_protocol=true
                 master_name="Vision"
             fi
-        elif db_exists "xray" "trojan"; then
-            local master_port=$(db_get_field "xray" "trojan" "port")
-            if [[ -n "$master_port" ]]; then
+        fi
+        if [[ "$is_fallback_protocol" == "false" ]] && db_exists "xray" "trojan"; then
+            local master_port=$(db_get_field "xray" "trojan" "port" 2>/dev/null)
+            if [[ "$master_port" == "8443" ]]; then
                 display_port="$master_port"
                 is_fallback_protocol=true
                 master_name="Trojan"
             fi
         fi
-        # 注意：不检测 vless (Reality)，因为 Reality 使用 uTLS 而非真实 TLS，不支持 WS 回落
     fi
     
     [[ "$clear_screen" == "true" ]] && _header
@@ -16367,7 +16395,9 @@ show_protocols_overview() {
     if [[ -n "$standalone_protocols" ]]; then
         echo -e "  ${Y}独立协议 (独立服务):${NC}"
         for protocol in $standalone_protocols; do
-            local port=$(db_get_field "singbox" "$protocol" "port")
+            # 先从 xray 获取，如果为空再从 singbox 获取
+            local port=$(db_get_field "xray" "$protocol" "port")
+            [[ -z "$port" ]] && port=$(db_get_field "singbox" "$protocol" "port")
             [[ -n "$port" ]] && echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$port${NC}"
         done
         echo ""
@@ -16744,11 +16774,12 @@ uninstall_specific_protocol() {
         rm -f "$CFG/sub_uuid"
         _ok "订阅服务已清理"
     else
-        # 还有其他协议，更新订阅文件
-        _info "更新订阅文件..."
-        generate_sub_files
+        # 还有其他协议，检查订阅服务是否已配置
+        if [[ -f "$CFG/sub.info" ]] || [[ -d "$CFG/subscription" ]]; then
+            _info "更新订阅文件..."
+            generate_sub_files
+        fi
     fi
-    
     _ok "$selected_protocol 已卸载"
     _pause
 }
@@ -16828,31 +16859,52 @@ do_uninstall() {
         cleaned_items+=("fake-web服务")
     fi
     
-    # 清理所有 vless 相关的 Nginx 配置
+    # 清理所有脚本生成的 Nginx 配置
     local nginx_cleaned=false
     
-    # 删除 sites-available/enabled 配置
-    for cfg in /etc/nginx/sites-enabled/vless-* /etc/nginx/sites-available/vless-*; do
-        [[ -f "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
+    # 删除 sites-available/enabled 配置 (包括 vless-* 和 xhttp-cdn)
+    for cfg in /etc/nginx/sites-enabled/vless-* /etc/nginx/sites-available/vless-* \
+               /etc/nginx/sites-enabled/xhttp-cdn /etc/nginx/sites-available/xhttp-cdn; do
+        [[ -f "$cfg" || -L "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
     done
     
     # 删除 conf.d 配置 (Debian/Ubuntu/CentOS)
-    for cfg in /etc/nginx/conf.d/vless-*.conf; do
+    for cfg in /etc/nginx/conf.d/vless-*.conf /etc/nginx/conf.d/xhttp-cdn.conf; do
         [[ -f "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
     done
     
     # 删除 http.d 配置 (Alpine)
-    for cfg in /etc/nginx/http.d/vless-*.conf; do
+    for cfg in /etc/nginx/http.d/vless-*.conf /etc/nginx/http.d/xhttp-cdn.conf; do
         [[ -f "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
     done
     
-    # 如果清理了配置，重载 nginx 释放端口
+    # 检查是否还有其他站点使用 Nginx
+    local nginx_has_other_sites=false
+    if command -v nginx &>/dev/null; then
+        # 检查是否有非默认的用户配置
+        local other_configs=$(find /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/http.d \
+            -type f -o -type l 2>/dev/null | grep -v default | wc -l)
+        [[ "$other_configs" -gt 0 ]] && nginx_has_other_sites=true
+    fi
+    
+    # 如果清理了配置
     if [[ "$nginx_cleaned" == "true" ]]; then
-        if command -v nginx &>/dev/null && nginx -t 2>/dev/null; then
-            svc reload nginx 2>/dev/null || svc restart nginx 2>/dev/null
-            cleaned_items+=("Nginx配置")
+        if [[ "$nginx_has_other_sites" == "true" ]]; then
+            # 还有其他站点，仅重载
+            if nginx -t 2>/dev/null; then
+                svc reload nginx 2>/dev/null || svc restart nginx 2>/dev/null
+                cleaned_items+=("Nginx配置")
+            fi
         else
-            _warn "Nginx配置有问题或未安装，跳过重载"
+            # 没有其他站点，停止并禁用 Nginx
+            _info "停止 Nginx 服务..."
+            svc stop nginx 2>/dev/null
+            if [[ "$DISTRO" == "alpine" ]]; then
+                rc-update del nginx default 2>/dev/null
+            else
+                systemctl disable nginx 2>/dev/null
+            fi
+            cleaned_items+=("Nginx服务")
         fi
     fi
     
@@ -16970,7 +17022,7 @@ select_protocol() {
     _item "14" "NaïveProxy"
     _item "0" "返回"
     echo ""
-    echo -e "  ${D}提示: 5/6 占用443端口，3/4 可作为回落共用${NC}"
+    echo -e "  ${D}提示: 5/6 使用 8443 端口时，3/4 可作为回落共用${NC}"
     echo ""
     
     while true; do
@@ -17459,19 +17511,20 @@ do_install_server() {
                 # TLS 模式继续原有流程
                 local uuid=$(gen_uuid) path="/vless"
                 
-                # 检查是否有主协议（用于回落）
+                # 检查是否有主协议在 8443 端口（仅 8443 端口才作为回落）
                 local master_domain=""
                 local master_protocol=""
-                if db_exists "xray" "vless"; then
-                    master_domain=$(db_get_field "xray" "vless" "sni")
-                    master_protocol="vless"
-                elif db_exists "xray" "vless-vision"; then
-                    master_domain=$(db_get_field "xray" "vless-vision" "sni")
-                    master_protocol="vless-vision"
-                elif db_exists "xray" "trojan"; then
-                    master_domain=$(db_get_field "xray" "trojan" "sni")
-                    master_protocol="trojan"
-                fi
+                local master_port=""
+                for proto in vless vless-vision trojan; do
+                    if db_exists "xray" "$proto"; then
+                        master_port=$(db_get_port "xray" "$proto" 2>/dev/null)
+                        if [[ "$master_port" == "8443" ]]; then
+                            master_domain=$(db_get_field "xray" "$proto" "sni" 2>/dev/null)
+                            master_protocol="$proto"
+                            break
+                        fi
+                    fi
+                done
                 
                 # 检查证书域名
                 local cert_domain=""
@@ -17507,13 +17560,26 @@ do_install_server() {
                 [[ -n "$_p" ]] && path="$_p"
                 [[ "$path" != /* ]] && path="/$path"
                 
+                # 检测是否为真实证书（用于决定是否显示订阅端口）
+                local _is_real_cert=false
+                if [[ -f "$CFG/certs/server.crt" ]]; then
+                    local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
+                    [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
+                fi
+                
                 echo ""
                 _line
                 echo -e "  ${C}VLESS+WS+TLS 配置${NC}"
                 _line
-                echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
+                # 根据是否为回落模式显示不同提示
+                if [[ -n "$master_protocol" ]]; then
+                    echo -e "  内部端口: ${G}$port${NC} (回落模式，外部通过 8443 访问)"
+                else
+                    echo -e "  端口: ${G}$port${NC}"
+                fi
+                echo -e "  UUID: ${G}${uuid:0:8}...${NC}"
                 echo -e "  SNI: ${G}$final_sni${NC}  Path: ${G}$path${NC}"
-                [[ -n "$cert_domain" ]] && echo -e "  订阅端口: ${G}${NGINX_PORT:-8443}${NC}"
+                [[ -n "$cert_domain" && "$_is_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}${NGINX_PORT:-18443}${NC}"
                 _line
                 echo ""
                 read -rp "  确认安装? [Y/n]: " confirm
@@ -17526,19 +17592,20 @@ do_install_server() {
         vmess-ws)
             local uuid=$(gen_uuid)
 
-            # 检查是否有主协议（用于回落）
+            # 检查是否有主协议在 8443 端口（仅 8443 端口才作为回落）
             local master_domain=""
             local master_protocol=""
-            if db_exists "xray" "vless"; then
-                master_domain=$(db_get_field "xray" "vless" "sni")
-                master_protocol="vless"
-            elif db_exists "xray" "vless-vision"; then
-                master_domain=$(db_get_field "xray" "vless-vision" "sni")
-                master_protocol="vless-vision"
-            elif db_exists "xray" "trojan"; then
-                master_domain=$(db_get_field "xray" "trojan" "sni")
-                master_protocol="trojan"
-            fi
+            local master_port=""
+            for proto in vless vless-vision trojan; do
+                if db_exists "xray" "$proto"; then
+                    master_port=$(db_get_port "xray" "$proto" 2>/dev/null)
+                    if [[ "$master_port" == "8443" ]]; then
+                        master_domain=$(db_get_field "xray" "$proto" "sni" 2>/dev/null)
+                        master_protocol="$proto"
+                        break
+                    fi
+                fi
+            done
             
             # 检查证书域名
             local cert_domain=""
@@ -17606,7 +17673,12 @@ do_install_server() {
             _line
             echo -e "  ${C}VMess + WS 配置${NC}"
             _line
-            echo -e "  内部端口: ${G}$port${NC} (若启用 443 回落复用，会走 ${master_protocol:-主协议} 的 443 对外)"
+            # 根据是否为回落模式显示不同提示
+            if [[ -n "$master_protocol" ]]; then
+                echo -e "  内部端口: ${G}$port${NC} (回落模式，外部通过 ${master_protocol} 的 8443 端口访问)"
+            else
+                echo -e "  端口: ${G}$port${NC}"
+            fi
             echo -e "  UUID: ${G}$uuid${NC}"
             echo -e "  SNI/Host: ${G}$final_sni${NC}"
             echo -e "  WS Path: ${G}$path${NC}"
@@ -17633,8 +17705,14 @@ do_install_server() {
             echo -e "  ${C}VLESS-XTLS-Vision 配置${NC}"
             _line
             echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
+            # 检测是否为真实证书
+            local _is_real_cert=false
+            if [[ -f "$CFG/certs/server.crt" ]]; then
+                local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
+                [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
+            fi
             echo -e "  SNI: ${G}$final_sni${NC}"
-            [[ -n "$CERT_DOMAIN" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
+            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
@@ -17979,7 +18057,13 @@ do_install_server() {
             echo -e "  密码: ${G}$password${NC}"
             echo -e "  SNI: ${G}$final_sni${NC}"
             [[ "$use_ws" == "true" ]] && echo -e "  Path: ${G}$path${NC}"
-            [[ -n "$CERT_DOMAIN" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
+            # 检测是否为真实证书
+            local _is_real_cert=false
+            if [[ -f "$CFG/certs/server.crt" ]]; then
+                local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
+                [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
+            fi
+            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
@@ -20260,7 +20344,7 @@ setup_subscription_interactive() {
     fi
     
     # 端口（带冲突检测）
-    local default_port=8443
+    local default_port=18443
     local sub_port=""
     
     while true; do
@@ -22439,6 +22523,14 @@ _add_user() {
     local core="$1" proto="$2"
     local proto_name=$(get_protocol_name "$proto")
     
+    # 检查是否为独立协议（不支持多用户）
+    if is_standalone_protocol "$proto"; then
+        echo ""
+        _err "$proto_name 为独立协议，不支持多用户管理"
+        _info "该协议使用配置文件中的固定密钥，无需添加用户"
+        return 1
+    fi
+    
     echo ""
     _line
     echo -e "  ${W}添加用户 - $proto_name${NC}"
@@ -22560,6 +22652,13 @@ _delete_user() {
         [[ "$choice" == "0" ]] && return
         if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$max" ]]; then
             local name="${user_array[$((choice-1))]}"
+            
+            # 禁止删除 default 用户
+            if [[ "$name" == "default" ]]; then
+                _err "default 用户不能删除"
+                _info "default 是协议的默认用户，删除会导致协议无法正常工作"
+                return
+            fi
             
             # 确认删除
             read -rp "  确认删除用户 $name? [y/N]: " confirm
@@ -22818,7 +22917,7 @@ _regenerate_config() {
                     ;;
                 chain:*)
                     local node_name="${user_routing#chain:}"
-                    xray_user_rules=$(echo "$xray_user_rules" | jq --arg user "$user_email" --arg tag "proxy-${node_name}" \
+                    xray_user_rules=$(echo "$xray_user_rules" | jq --arg user "$user_email" --arg tag "chain-${node_name}-prefer-ipv4" \
                         '. + [{"type": "field", "user": [$user], "outboundTag": $tag}]')
                     needed_chain_nodes="$needed_chain_nodes $node_name"
                     ;;
@@ -22852,7 +22951,7 @@ _regenerate_config() {
                 local password=$(echo "$node_config" | jq -r '.password // ""')
                 
                 if [[ "$node_type" == "socks" ]]; then
-                    local outbound="{\"tag\": \"proxy-${node_name}\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"$server\", \"port\": $port"
+                    local outbound="{\"tag\": \"chain-${node_name}-prefer-ipv4\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"$server\", \"port\": $port"
                     if [[ -n "$username" && -n "$password" ]]; then
                         outbound="$outbound, \"users\": [{\"user\": \"$username\", \"pass\": \"$password\"}]"
                     fi
@@ -22890,7 +22989,7 @@ _regenerate_config() {
         chain_outbounds="[]"
         for node_name in $needed_chain_nodes; do
             # 检查是否已添加
-            local exists=$(echo "$chain_outbounds" | jq --arg t "proxy-${node_name}" '[.[] | select(.tag == $t)] | length')
+            local exists=$(echo "$chain_outbounds" | jq --arg t "chain-${node_name}-prefer-ipv4" '[.[] | select(.tag == $t)] | length')
             [[ "$exists" != "0" ]] && continue
             
             local node_config=$(jq -r --arg n "$node_name" '.chain_proxy.nodes[] | select(.name == $n)' "$DB_FILE" 2>/dev/null)
@@ -22902,7 +23001,7 @@ _regenerate_config() {
                 local password=$(echo "$node_config" | jq -r '.password // ""')
                 
                 if [[ "$node_type" == "socks" ]]; then
-                    local outbound="{\"tag\": \"proxy-${node_name}\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"$server\", \"port\": $port"
+                    local outbound="{\"tag\": \"chain-${node_name}-prefer-ipv4\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"$server\", \"port\": $port"
                     if [[ -n "$username" && -n "$password" ]]; then
                         outbound="$outbound, \"users\": [{\"user\": \"$username\", \"pass\": \"$password\"}]"
                     fi
@@ -22925,8 +23024,8 @@ _regenerate_config() {
               --argjson user_rules "$all_user_rules" \
               --argjson chain_obs "$chain_outbounds" \
               --argjson balancers "$xray_balancers" '
-            # 更新 clients
-            .inbounds[0].settings.clients = $clients |
+            # 更新 clients (通过 protocol 查找 VLESS inbound，避免索引问题)
+            (.inbounds[] | select(.protocol == "vless")).settings.clients = $clients |
             
             # 确保 routing 结构存在
             if .routing == null then .routing = {"domainStrategy": "AsIs", "rules": []} else . end |
@@ -22968,17 +23067,25 @@ _regenerate_config() {
             else . end |
             
             # 更新用户级路由规则
-            # 移除旧的用户级规则（只保留没有 user 字段或 user 不是数组的规则），然后添加新规则
-            .routing.rules = ([.routing.rules[]? | select(
-                (.user == null or (.user | type) != "array")
-            )] + $user_rules)
+            # 用户级规则优先于全局规则：API规则 > 用户规则 > 其他规则
+            .routing.rules = (
+                # 1. API 规则必须在最前
+                [.routing.rules[]? | select(.inboundTag != null and (.inboundTag | contains(["api"])))] +
+                # 2. 用户级路由规则（高优先级）
+                $user_rules +
+                # 3. 其他规则（全局规则等）
+                [.routing.rules[]? | select(
+                    (.user == null or (.user | type) != "array") and
+                    (.inboundTag == null or (.inboundTag | contains(["api"])) | not)
+                )]
+            )
         ' "$config_file" > "$tmp" 2>/dev/null; then
             mv "$tmp" "$config_file"
         else
             rm -f "$tmp"
             # 如果完整更新失败，至少尝试更新 clients
             tmp=$(mktemp)
-            if jq --argjson clients "$users_json" '.inbounds[0].settings.clients = $clients' "$config_file" > "$tmp" 2>/dev/null; then
+            if jq --argjson clients "$users_json" '(.inbounds[] | select(.protocol == "vless")).settings.clients = $clients' "$config_file" > "$tmp" 2>/dev/null; then
                 mv "$tmp" "$config_file"
             else
                 rm -f "$tmp"

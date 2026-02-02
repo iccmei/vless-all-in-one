@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.6] - 2026-02-02
+
+### Added
+- 新增独立协议检测功能
+- 新增 default 用户删除保护
+### Fixed
+- 修复独立协议在「查看协议配置」菜单中不显示的问题
+- 修复用户路由优先级问题
+  - 路由规则顺序：API 规则 → 用户规则 → 全局规则
+- 修复 Snell 协议错误输出 Loon 配置的问题
+- 修复「协议服务管理」菜单独立协议不显示的问题
+- 修复端口占用检测误判问题
+- 修复完全卸载后 Nginx 未停止的问题
+### Changed
+- 更新 Reality SNI 列表（精选 22 个大陆三网延迟 <100ms 的苹果子域名）
+- 调整 WS 类协议回落触发条件
+  - 仅当主协议 (VLESS-Vision/Trojan) 端口为 8443 时才启用回落
+- 订阅服务默认端口从 8443 调整为 18443
+- 自签名证书 SNI 配置优化
+
+
+
 ## [3.4.5] - 2026-02-01
 
 ### Added
