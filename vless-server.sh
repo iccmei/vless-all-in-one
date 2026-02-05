@@ -23435,6 +23435,13 @@ _configure_tg_notify() {
                 _pause
                 ;;
             6)
+                # 检查并自动设置为中国时区（海外服务器需要）
+                local current_tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "")
+                if [[ "$current_tz" != "Asia/Shanghai" ]]; then
+                    _info "检测到服务器时区为 ${current_tz}，自动设置为中国时区 (Asia/Shanghai)..."
+                    timedatectl set-timezone Asia/Shanghai 2>/dev/null && _ok "时区已设置为 Asia/Shanghai"
+                fi
+                
                 echo ""
                 echo -e "  ${W}每日报告设置${NC}"
                 _line
