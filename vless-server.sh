@@ -23469,6 +23469,8 @@ _configure_tg_notify() {
                                [[ "$new_minute" -ge 0 ]] && [[ "$new_minute" -le 59 ]]; then
                                 tg_set_config "daily_report_hour" "$new_hour"
                                 tg_set_config "daily_report_minute" "$new_minute"
+                                # 清空上次发送日期，允许今天再次发送
+                                tg_set_config "last_report_date" ""
                                 _ok "发送时间已更新为 $(printf '%02d:%02d' $new_hour $new_minute)"
                             else
                                 _err "无效的时间 (小时: 0-23, 分钟: 0-59)"
@@ -23506,6 +23508,8 @@ _configure_tg_notify() {
                             tg_set_config "notify_daily" "true"
                             tg_set_config "daily_report_hour" "$new_hour"
                             tg_set_config "daily_report_minute" "$new_minute"
+                            # 清空上次发送日期，允许今天立即发送
+                            tg_set_config "last_report_date" ""
                             _ok "每日报告已启用，将在每天 $(printf '%02d:%02d' $new_hour $new_minute) 发送"
                         else
                             _err "无效的时间 (小时: 0-23, 分钟: 0-59)"
